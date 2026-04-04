@@ -39,10 +39,42 @@ resource "aws_cloudfront_distribution" "frontend" {
     origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
   }
 
+  origin {
+    domain_name = var.alb_dns_name
+    origin_id   = "orgsession-alb-${var.env}"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
   enabled             = true
   is_ipv6_enabled     = true
   default_root_object = var.default_root_object
   comment             = "orgsession-fe-${var.env}"
+
+  ordered_cache_behavior {
+    path_pattern           = "/status"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "orgsession-alb-${var.env}"
+    viewer_protocol_policy = "https-only"
+    compress               = false
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+  }
 
   default_cache_behavior {
     allowed_methods        = ["GET", "HEAD"]

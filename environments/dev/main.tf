@@ -34,6 +34,7 @@ module "s3_cloudfront" {
 
   env            = local.env
   aws_account_id = var.aws_account_id
+  alb_dns_name   = module.alb.alb_dns_name
 }
 
 module "ecs" {
@@ -55,7 +56,7 @@ module "secrets" {
   source = "../../modules/secrets"
 
   env                        = local.env
-  api_url                    = "http://${module.alb.alb_dns_name}"
+  api_url                    = "https://${module.s3_cloudfront.cloudfront_domain_name}"
   s3_bucket                  = module.s3_cloudfront.bucket_name
   cloudfront_distribution_id = module.s3_cloudfront.cloudfront_distribution_id
   cloudfront_domain_name     = module.s3_cloudfront.cloudfront_domain_name
