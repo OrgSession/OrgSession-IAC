@@ -1,0 +1,100 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches:
+      - development
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    name: Plan (${{ github.base_ref == 'main' && 'prod' || 'dev' }})
+    runs-on: ubuntu-latest
+
+    env:
+      TF_ENV: ${{ github.base_ref == 'main' && 'prod' || 'dev' }}
+
+    defaults:
+      run:
+        working-directory: environments/${{ github.base_ref == 'main' && 'prod' || 'dev' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_ENV }}-pr-${{ github.event.pull_request.number }}
+          path: environments/${{ env.TF_ENV }}/tfplan
+          retention-days: 5
+
+      - name: Post plan summary to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.TF_ENV;
+            const planOutput = fs.readFileSync(
+              `environments/${env}/plan_output.txt`, 'utf8'
+            );
+            const truncated = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n\n... output truncated ...'
+              : planOutput;
+            const body = [
+              `## Terraform Plan: ${env}`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```hcl',
+              truncated,
+              '```',
+              '',
+              '</details>',
+              '',
+              `Plan status: ${{ steps.plan.outcome }}`
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
