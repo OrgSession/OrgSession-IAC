@@ -1,0 +1,48 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - development
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    name: Apply (${{ github.ref_name == 'main' && 'prod' || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+
+    env:
+      TF_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+
+    defaults:
+      run:
+        working-directory: environments/${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -auto-approve
