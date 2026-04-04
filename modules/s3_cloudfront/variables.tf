@@ -13,3 +13,8 @@ variable "default_root_object" {
   type        = string
   default     = "index.html"
 }
+
+variable "alb_dns_name" {
+  description = "DNS name of the ALB to use as the API origin"
+  type        = string
+}
