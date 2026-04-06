@@ -41,8 +41,30 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      - name: Find current PR
+        uses: jwalton/gh-find-current-pr@v1
+        id: findPr
+        with:
+          state: all
+
+      - name: Download plan artifact
+        uses: dawidd6/action-download-artifact@v3
+        if: success() && steps.findPr.outputs.number != ''
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: terraform-plan.yml
+          name: tfplan-${{ env.TF_ENV }}-pr-${{ steps.findPr.outputs.number }}
+          path: environments/${{ env.TF_ENV }}
+        continue-on-error: true
+
       - name: Terraform Apply
         run: |
-          terraform apply \
-            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
-            -auto-approve
+          if [ -f "tfplan" ]; then
+            echo "Applying saved plan from PR"
+            terraform apply -auto-approve tfplan
+          else
+            echo "No saved plan found, applying directly"
+            terraform apply \
+              -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+              -auto-approve
+          fi
