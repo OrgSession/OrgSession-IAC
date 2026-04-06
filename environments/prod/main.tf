@@ -65,3 +65,9 @@ module "secrets" {
   ecs_cluster_name           = module.ecs.cluster_name
   ecs_service_name           = module.ecs.service_name
 }
+
+module "s3" {
+  source = "../../modules/s3"
+
+  env = local.env
+}
