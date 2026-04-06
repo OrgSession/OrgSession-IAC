@@ -25,24 +25,39 @@ OrgSession-IAC  OrgSession-BE   OrgSession-FE
 GitHub Actions  GitHub Actions  GitHub Actions
   |               |                |
   v               v                v
-AWS Infrastructure  ECR -> ECS    S3 + CloudFront
-  |                 Fargate         |
-  |                   |             |
-  +-----> ALB <-------+    <--------+
-           |
-           v
-    /status endpoint
+AWS              ECR ->          S3 +
+Infrastructure   ECS Fargate     CloudFront
+                      |               |
+                      v               v
+                     ALB         CloudFront
+                      |          Distribution
+                      |               |
+                      |    /status    |    /*
+                      +<--------------+----+
+                                      |
+                               Browser Request
+                               https://cf-domain/status  -> CloudFront -> ALB -> ECS
+                               https://cf-domain/         -> CloudFront -> S3
 ```
+
+### Dual-Origin CloudFront Routing
+
+CloudFront is configured with two origins:
+
+- **S3 origin** (default behavior, `/*`): serves the React static bundle with caching
+- **ALB origin** (ordered behavior, `/status`): proxies API requests to ECS, TTL=0 (no caching)
+
+This means the browser talks only to CloudFront over HTTPS for both the frontend and the API. CloudFront forwards `/status` to the ALB over HTTP internally on the private network. There is no mixed content issue and no CORS requirement because all browser requests go to the same origin.
 
 ### Component Responsibilities
 
 **OrgSession-IAC** defines all AWS infrastructure as Terraform code. It is the source of truth for every cloud resource. Changes to infrastructure go through the same PR review and pipeline as application code.
 
-**OrgSession-BE** contains a minimal FastAPI service with a single `/status` endpoint. It is containerized with Docker and deployed to ECS Fargate behind an Application Load Balancer.
+**OrgSession-BE** contains a minimal FastAPI service with a single `/status` endpoint. It is containerized with Docker and deployed to ECS Fargate behind an Application Load Balancer. The ALB is not directly reachable by the browser -- requests arrive via CloudFront.
 
-**OrgSession-FE** contains a React/Vite single-page application. It calls the backend API and renders the response in a dashboard. It is deployed as a static site to S3, served globally through CloudFront.
+**OrgSession-FE** contains a React/Vite single-page application. It calls `/status` on the same CloudFront domain and renders the response in a dashboard. It is deployed as a static site to S3, served globally through CloudFront.
 
-**AWS Secrets Manager** holds the backend ALB URL. The frontend CI/CD pipeline reads it at build time so the API URL is compiled into the static bundle without being hardcoded in source control.
+**AWS Secrets Manager** holds the full deployment configuration for each environment: the HTTPS CloudFront URL (used as the API URL), S3 bucket name, CloudFront distribution ID, ECR repository details, and ECS cluster and service names. Both the backend and frontend CI/CD pipelines read from this secret at runtime. No resource names are hardcoded in workflow files.
 
 ---
 
@@ -68,27 +83,34 @@ On merge to `development`, `terraform apply` runs for dev automatically using th
 
 **Pull Request trigger:**
 
-A PR to `development` or `main` triggers the `PR Checks` workflow, which runs the pytest suite and verifies the Docker image builds successfully. No deployment occurs on a PR.
+A PR to `development` or `main` triggers the `build` workflow, which runs the pytest suite and verifies the Docker image builds successfully. No deployment occurs on a PR. Tests use a separate `requirements-dev.txt` that includes pytest and httpx; the production `requirements.txt` contains only fastapi and uvicorn.
 
 **Merge trigger:**
 
-On merge, the `Deploy Backend` workflow reads the target environment from the branch name. It then fetches the ECR repository name, ECS cluster, and ECS service from Secrets Manager (`orgsession/dev/config` or `orgsession/prod/config`). This means the workflow contains no hardcoded resource names -- all deployment targets are resolved at runtime from the infrastructure's own configuration store.
+On merge, the `deploy` workflow reads the target environment from the branch name. It fetches the ECR repository name, ECS cluster name, and ECS service name from Secrets Manager (`orgsession/dev/config` or `orgsession/prod/config`). This means the workflow contains no hardcoded resource names -- all deployment targets are resolved at runtime.
 
-The pipeline runs tests first, then builds a Docker image, pushes it to ECR with two tags (the git commit SHA and `latest`), and triggers an ECS service update.
+The pipeline runs tests, builds a Docker image, and pushes it to ECR tagged with both the git commit SHA and `latest`. Then it registers a new ECS task definition revision:
 
-The SHA tag creates an audit trail: you can look at any running ECS task and trace it to a specific git commit. The `latest` tag is used for convenience when forcing a redeployment with `--force-new-deployment`.
+1. Fetch the current task definition from ECS
+2. Reconstruct a new task definition JSON by selecting only the writable fields (family, roles, network mode, cpu, memory, container definitions)
+3. Replace the container image in `containerDefinitions` with the new ECR image URI
+4. Register the new task definition revision via `aws ecs register-task-definition`
+5. Update the ECS service to the new revision via `aws ecs update-service --task-definition`
+6. Wait for the service to stabilize via `aws ecs wait services-stable`
 
-After triggering the deployment, the workflow runs `aws ecs wait services-stable`, which polls the ECS service until all tasks have started successfully or the timeout is reached. This makes the pipeline fail fast if the new container crashes on startup.
+This approach guarantees that ECS uses the exact image that was just pushed, identified by commit SHA. It avoids the `--force-new-deployment` pattern, which can re-pull the `latest` tag without guaranteeing which image version ECS actually runs.
 
 ### Frontend Pipeline (OrgSession-FE)
 
 **Pull Request trigger:**
 
-A PR to `development` or `main` triggers the `PR Checks` workflow, which runs `npm ci` and `npm run build` with a placeholder API URL. This verifies the build toolchain and all imports resolve correctly without connecting to any real backend.
+A PR to `development` or `main` triggers the `build` workflow, which runs `npm ci` and `npm run build` with a placeholder API URL. This verifies the build toolchain and all imports resolve correctly without connecting to any real backend.
 
 **Merge trigger:**
 
-On merge, the `Deploy Frontend` workflow reads three values from Secrets Manager: the API URL, the S3 bucket name, and the CloudFront distribution ID. These were written there by Terraform during infrastructure provisioning. The pipeline reads the backend API URL from Secrets Manager, runs `npm ci` (reproducible installs), builds the Vite bundle with the API URL baked in as an environment variable, syncs the output to S3, and invalidates the CloudFront distribution cache.
+On merge, the `deploy` workflow reads three values from Secrets Manager: the HTTPS CloudFront URL (used as the API URL), the S3 bucket name, and the CloudFront distribution ID. These were written there by Terraform during infrastructure provisioning.
+
+The pipeline builds the Vite bundle with `VITE_API_URL` set to the HTTPS CloudFront URL. Because the frontend and the `/status` endpoint are both served from the same CloudFront domain, this is a same-origin request with no CORS headers needed. The built files are synced to S3 and the CloudFront distribution cache is invalidated.
 
 The CloudFront invalidation is critical. Without it, users on edge nodes that have cached the old `index.html` would continue to see the previous version until the TTL expires. The `/*` invalidation forces all edge locations to fetch fresh content on the next request.
 
@@ -120,7 +142,21 @@ This is the most straightforward approach for a POC and is universally supported
 
 **Trade-off:** Access keys are long-lived credentials that must be rotated periodically and revoked if a repository is compromised. The production hardening path is to replace this with OIDC, which eliminates the static secret entirely by issuing short-lived credentials per workflow run. For this POC, access keys are the right balance of simplicity and control.
 
-**Rotation procedure:** To rotate the key, create a new access key for the IAM user, update the GitHub secrets in all three repos, then delete the old key. This can be scripted and automated on a schedule.
+**Rotation procedure:** To rotate the key, create a new access key for the IAM user, update the GitHub secrets in all three repos, then delete the old key.
+
+### CloudFront as API Proxy
+
+**Decision:** Route all browser-facing API calls through CloudFront (`/status`) rather than directly to the ALB.
+
+**Reasoning:**
+
+The frontend is served over HTTPS from CloudFront. If the browser were to call the ALB directly over HTTP, browsers would block it as a mixed content violation -- an HTTPS page is not permitted to make HTTP subrequests. The two available remedies are: (1) put an ACM certificate on the ALB and use HTTPS end-to-end, or (2) proxy the API call through CloudFront so the browser only ever talks HTTPS to one domain.
+
+Option 2 costs nothing extra (CloudFront is already deployed) and eliminates the ALB HTTPS setup, ACM certificate provisioning, and custom domain requirements. It also removes the CORS requirement entirely: because both the page and the API call go to the same CloudFront domain, the browser treats it as a same-origin request.
+
+CloudFront is configured with a separate ordered cache behavior for the `/status` path with TTL=0. This ensures the browser always gets a live response from ECS, not a cached CloudFront response.
+
+**Trade-off:** The ALB is still HTTP-only. Traffic from CloudFront to the ALB is unencrypted inside the AWS network. For a POC this is acceptable. Production hardening would add an ACM certificate to the ALB and change the CloudFront origin protocol to HTTPS-only.
 
 ### ECS Fargate vs EC2 vs Lambda
 
@@ -150,17 +186,19 @@ S3 + CloudFront is the industry standard for serving static sites at scale. It i
 
 **Trade-off:** More Terraform and more workflow steps compared to Amplify. The operational model is explicit but verbose.
 
-### Container Image Tagging Strategy
+### Container Image Tagging and Deployment Strategy
 
-**Decision:** Tag images with both the git commit SHA and `latest`.
+**Decision:** Tag images with both the git commit SHA and `latest`. Deploy by registering a new task definition revision with the SHA-tagged image, then updating the ECS service to that revision.
 
 **Reasoning:**
 
 The SHA tag is immutable and traceable. If you look at a running ECS task, you can read the image tag and find the exact commit that produced it. This is essential for debugging production issues.
 
-The `latest` tag enables `--force-new-deployment` to work. ECS uses `latest` when you want to re-pull the current image without creating a new task definition revision.
+Registering a new task definition revision (rather than using `--force-new-deployment` with `latest`) guarantees that ECS runs exactly the image that was just built and verified in the same pipeline run. With `--force-new-deployment`, ECS re-pulls `latest` from ECR -- there is a window where a concurrent push from another workflow could change what `latest` points to.
 
-For a more robust production pipeline, you would: register a new task definition revision with the SHA-tagged image explicitly, update the service to use that revision, and retain previous revisions for rollback. This POC uses `force-new-deployment` for simplicity.
+The registration approach also creates an auditable revision history in ECS. Rolling back to a previous version is a single `aws ecs update-service --task-definition <previous-arn>` command.
+
+The `jq` reconstruction selects only the writable fields (family, roles, network mode, cpu, memory, volumes, container definitions) rather than deleting known read-only fields. This is more resilient: AWS can add new read-only fields to a task definition without breaking the pipeline.
 
 ---
 
@@ -172,7 +210,7 @@ For a more robust production pipeline, you would: register a new task definition
 
 ### Show the running system
 
-"The frontend is running at this CloudFront URL. It calls our FastAPI backend through an Application Load Balancer. All of this was provisioned by Terraform and deployed by GitHub Actions."
+"The frontend is running at this CloudFront URL. It calls our FastAPI backend through the same CloudFront domain -- the `/status` path is proxied through to ECS. All of this was provisioned by Terraform and deployed by GitHub Actions."
 
 Point to: app name, version badge (v1), environment badge (dev), status indicator, timestamp updating.
 
@@ -180,22 +218,23 @@ Point to: app name, version badge (v1), environment badge (dev), status indicato
 
 Open `OrgSession-BE/app/config.py`. Change `VERSION = "v1"` to `VERSION = "v2"`.
 
-"I am going to make a single-line change to the backend: bump the version to v2. I will commit and push directly to main."
+"I am going to make a single-line change to the backend: bump the version to v2. I will push to the `development` branch, which deploys to the dev environment."
 
 ```bash
 git add app/config.py
 git commit -m "Bump version to v2"
-git push origin main
+git push origin development
 ```
 
 ### Walk through the pipeline stages
 
-In GitHub Actions, show the running workflow:
+In GitHub Actions, show the running `deploy` workflow:
 
 1. "Tests run first. No deployment happens if tests fail."
 2. "Docker builds the image, tags it with the commit SHA and latest, and pushes to ECR."
-3. "ECS receives the force-new-deployment signal. It pulls the new image and starts replacement tasks."
-4. "The pipeline waits for ECS to stabilize before declaring success."
+3. "The pipeline fetches the current task definition from ECS, reconstructs it with the new image, and registers a new task definition revision."
+4. "ECS updates the service to use the new revision and begins a rolling replacement of tasks."
+5. "The pipeline waits for ECS to stabilize before declaring success."
 
 ### Show the result
 
@@ -205,7 +244,7 @@ After the workflow completes (~3-4 minutes), refresh the frontend dashboard.
 
 ### Show the infrastructure gate
 
-"If I had made a change to Terraform instead, the pipeline would have run plan, posted the plan to the PR as a comment, and waited for code review before applying. Production would have required an additional human approval step."
+"If I had made a change to Terraform instead, the pipeline would have run plan, posted the plan to the PR as a comment, and waited for code review before applying. Merging to `main` for production would require an additional human approval step in the GitHub Environment."
 
 ---
 
@@ -213,15 +252,19 @@ After the workflow completes (~3-4 minutes), refresh the frontend dashboard.
 
 **Q: How do you handle secrets in the application?**
 
-A: There are two layers. GitHub Actions uses static IAM access keys stored as GitHub secrets -- these are encrypted, masked in logs, and scoped to a dedicated IAM user. Application configuration (API URL, S3 bucket name, ECS service name) is stored in AWS Secrets Manager by Terraform after provisioning. Workflows read these values at runtime so no resource names are hardcoded in workflow files. The backend reads its configuration through environment variables injected by ECS at container startup. No secrets appear in source code.
+A: There are two layers. GitHub Actions uses static IAM access keys stored as GitHub secrets -- these are encrypted, masked in logs, and scoped to a dedicated IAM user. All deployment configuration (CloudFront URL, S3 bucket name, ECS service name, ECR repo name) is stored in AWS Secrets Manager by Terraform after provisioning. Workflows read these values at runtime so no resource names are hardcoded in workflow files. The backend reads its application configuration through environment variables injected by ECS at container startup. No secrets appear in source code.
+
+**Q: How do you avoid the mixed content error (HTTPS page calling HTTP API)?**
+
+A: CloudFront is configured with two origins. The S3 origin handles all static asset requests (`/*`). The ALB origin handles API requests (`/status`) with an ordered cache behavior at TTL=0. The browser always sends requests to the same CloudFront HTTPS domain -- it never directly touches the HTTP ALB. CloudFront proxies `/status` to the ALB over HTTP internally on the AWS network. This approach avoids both the mixed content violation and any CORS requirements (since page and API share the same origin). The trade-off is that CloudFront-to-ALB traffic is unencrypted; adding an ACM certificate to the ALB would close that gap in production.
 
 **Q: How do you roll back a bad deployment?**
 
-A: For the backend, ECS keeps the previous task definition revision. You can roll back by running `aws ecs update-service` pointing to the previous revision, or by reverting the commit and letting the pipeline redeploy. For the frontend, S3 bucket versioning is enabled, so you can restore previous objects. CloudFront can be pointed at a different S3 path or object version.
+A: For the backend, each push registers a new ECS task definition revision. Rolling back is a single command: `aws ecs update-service --cluster <cluster> --service <service> --task-definition <previous-revision-arn>`. ECS retains all previous revisions. For the frontend, S3 bucket versioning is enabled, so you can restore previous object versions. CloudFront cache is invalidated on each deploy, so rolling S3 back takes effect on the next request.
 
 **Q: How would you make this production-ready?**
 
-A: Several hardening steps beyond this POC: add HTTPS with ACM certificates on the ALB and a custom domain on CloudFront; add WAF rules on CloudFront and the ALB; implement ECS auto-scaling based on ALB request count; add a blue/green deployment strategy using CodeDeploy with ECS to enable zero-downtime deploys with automated rollback on health check failure; add structured logging and metrics to CloudWatch; set up alerting on ECS task failure and ALB 5xx rate; move the GitHub Actions role to least-privilege with a scoped policy instead of managed admin policies.
+A: Several hardening steps beyond this POC: add an ACM certificate to the ALB and change the CloudFront origin protocol to HTTPS-only (eliminating unencrypted CloudFront-to-ALB traffic); add a custom domain on CloudFront with its own ACM certificate; add WAF rules on CloudFront and the ALB; implement ECS auto-scaling based on ALB request count; add a blue/green deployment strategy using CodeDeploy with ECS to enable zero-downtime deploys with automated rollback on health check failure; add structured logging and metrics to CloudWatch; set up alerting on ECS task failure and ALB 5xx rate; replace static IAM access keys with OIDC for GitHub Actions authentication.
 
 **Q: Why not use AWS CodePipeline instead of GitHub Actions?**
 
@@ -229,7 +272,7 @@ A: GitHub Actions colocates the pipeline definition with the code in the same re
 
 **Q: How do dev and prod share the same ECR repository?**
 
-A: They do not. Each environment has its own ECR repository: `orgsession-be-dev` and `orgsession-be-prod`. The backend CI/CD workflow targets `orgsession-be-dev` when deploying to the dev ECS cluster. A separate workflow job or a parameterized workflow would target `orgsession-be-prod` for the production deployment. This isolation ensures a dev image push cannot accidentally affect the production service.
+A: They do not. Each environment has its own ECR repository: `orgsession-be-dev` and `orgsession-be-prod`. The backend CI/CD workflow reads the ECR repository URL from Secrets Manager at runtime. The dev secret points to the dev ECR repo; the prod secret points to the prod ECR repo. This isolation ensures a dev image push cannot accidentally affect the production service.
 
 **Q: What does the Terraform wrapper pattern protect against?**
 
@@ -259,14 +302,15 @@ The NAT Gateway is the largest cost item. For a short-lived POC, you can elimina
 
 The following items are out of scope for this POC but represent the path to production readiness:
 
-1. **HTTPS everywhere**: ACM certificate on ALB, custom domain on CloudFront with ACM certificate
-2. **Custom domains**: Route 53 hosted zone, ALB alias record, CloudFront CNAME
-3. **WAF**: AWS WAF on CloudFront and ALB with managed rule groups for OWASP Top 10
-4. **Blue/green deployments**: CodeDeploy + ECS for zero-downtime deploys with automatic rollback
-5. **Auto-scaling**: ECS service auto-scaling based on ALB RequestCountPerTarget
-6. **Multi-AZ redundancy**: Increase ECS desired count to at least 2, spread across AZs
-7. **Centralized logging**: Structured JSON logs from FastAPI, aggregated in CloudWatch
-8. **Alerting**: CloudWatch Alarms on ALB 5xx rate, ECS task failure count, and target response time
-9. **Container image scanning**: Enable ECR scan-on-push and fail CI if critical vulnerabilities are found
-10. **Least-privilege IAM**: Replace managed policies on the GitHub Actions role with a scoped custom policy
-11. **Multi-region**: Route 53 latency-based routing with ECS clusters in two regions
+1. **ALB HTTPS**: ACM certificate on the ALB listener; update CloudFront origin protocol to HTTPS-only to encrypt CloudFront-to-ALB traffic
+2. **Custom domains**: Route 53 hosted zone, ALB alias record, CloudFront CNAME with ACM certificate
+3. **OIDC for GitHub Actions**: Replace static IAM access keys with OIDC federation; short-lived credentials per workflow run, no rotation required
+4. **WAF**: AWS WAF on CloudFront and ALB with managed rule groups for OWASP Top 10
+5. **Blue/green deployments**: CodeDeploy + ECS for zero-downtime deploys with automatic rollback on health check failure
+6. **Auto-scaling**: ECS service auto-scaling based on ALB RequestCountPerTarget
+7. **Multi-AZ redundancy**: Increase ECS desired count to at least 2, spread across AZs
+8. **Centralized logging**: Structured JSON logs from FastAPI, aggregated in CloudWatch
+9. **Alerting**: CloudWatch Alarms on ALB 5xx rate, ECS task failure count, and target response time
+10. **Container image scanning**: Enable ECR scan-on-push and fail CI if critical vulnerabilities are found
+11. **Least-privilege IAM**: Replace managed policies on the GitHub Actions role with a scoped custom policy
+12. **Multi-region**: Route 53 latency-based routing with ECS clusters in two regions
